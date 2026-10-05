@@ -9,12 +9,17 @@ name = "signscanner"
 path = "src/lib.rs"
 
 [[bin]]
-name = "SignScanner"
+name = "signscanner"
 path = "src/main.rs"
 
 [dependencies]
 iced-x86 = "1.21"
 memmap2 = "0.9"
+
+# CLI + 彩色 TUI（与 qqshark 同款配色栈）
+clap = { version = "4", features = ["derive"] }
+anstream = "0.6"
+anstyle = "1"
 
 [profile.release]
 opt-level = 3
