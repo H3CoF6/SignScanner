@@ -1,0 +1,22 @@
+[package]
+name = "SignScanner"
+version = "0.1.0"
+edition = "2024"
+description = "Statically locate the QQ wrapper.node sign function via stable RTTI/name anchors (no byte signatures)."
+
+[lib]
+name = "signscanner"
+path = "src/lib.rs"
+
+[[bin]]
+name = "SignScanner"
+path = "src/main.rs"
+
+[dependencies]
+iced-x86 = "1.21"
+memmap2 = "0.9"
+
+[profile.release]
+opt-level = 3
+lto = true
+strip = true
