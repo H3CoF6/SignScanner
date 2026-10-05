@@ -111,10 +111,50 @@ struct VtableHit {
     slots: usize,
 }
 
-/// Walk every virtual function of `vtable_addr` and return the one that drives
-/// the sign core (a direct callee writing `+0xFF` / `+0x1FF` / `+0x2FF`).
+/// How many contiguous `.pdata` partitions may be folded into one logical
+/// function before we stop (guards against pathological metadata).
+const MAX_PDATA_MERGE: usize = 64;
+
+/// True when the bytes immediately before `end` mark a real function boundary:
+/// a terminator instruction or alignment padding. QQ's PE `.pdata` sometimes
+/// splits one function at ordinary instruction boundaries (no prologue, no
+/// `CHAININFO`), so such a split is only genuine when the previous code cannot
+/// fall through into it.
+fn ends_function(view: &View, end: u64) -> bool {
+    if end < 2 {
+        return true;
+    }
+    let Some(b0) = view.read(end - 1, 1).and_then(|s| s.first().copied()) else {
+        return true;
+    };
+    // ret / retf / ret imm / int3 / jmp: a function may end on any of these.
+    if matches!(b0, 0xC2 | 0xC3 | 0xCA | 0xCB | 0xCC | 0xE9 | 0xEB) {
+        return true;
+    }
+    // Two or more consecutive zero bytes are alignment padding.
+    b0 == 0x00
+        && matches!(
+            view.read(end - 2, 1).and_then(|s| s.first().copied()),
+            Some(0x00)
+        )
+}
+
+/// Exclusive end of the *logical* function starting at `addr`. PE `.pdata` can
+/// split one function into several contiguous entries; follow those splits so
+/// the whole body is scanned. Falls back to a fixed window when the container
+/// carries no boundary metadata (ELF) or the entry is missing.
 fn function_end(view: &View, addr: u64) -> u64 {
-    view.function_end(addr).unwrap_or(addr + MAX_FUNCTION_SCAN)
+    let mut end = view.function_end(addr).unwrap_or(addr + MAX_FUNCTION_SCAN);
+    for _ in 0..MAX_PDATA_MERGE {
+        if ends_function(view, end) {
+            break;
+        }
+        match view.function_end(end) {
+            Some(next) if next > end => end = next,
+            _ => break,
+        }
+    }
+    end
 }
 
 fn scan_vtable(view: &View, vtable_addr: u64) -> Option<VtableHit> {
