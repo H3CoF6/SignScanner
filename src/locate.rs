@@ -28,7 +28,7 @@
 
 use crate::aarch64;
 use crate::decode::BufferHits;
-use crate::image::{Abi, Arch, View};
+use crate::image::{Abi, Arch, Format, View};
 use crate::x86;
 
 /// Itanium-ABI RTTI name (Linux, macOS).
@@ -115,6 +115,11 @@ struct VtableHit {
 /// function before we stop (guards against pathological metadata).
 const MAX_PDATA_MERGE: usize = 64;
 
+/// Upper bound for forward decoding when a container carries no function
+/// boundary metadata (ELF). Big enough for the largest sign core seen
+/// (~82 KB on Windows x64) while still cheap to disassemble once.
+const MAX_TERMINATOR_SCAN: u64 = 0x40000;
+
 /// True when the bytes immediately before `end` mark a real function boundary:
 /// a terminator instruction or alignment padding. QQ's PE `.pdata` sometimes
 /// splits one function at ordinary instruction boundaries (no prologue, no
@@ -127,7 +132,9 @@ fn ends_function(view: &View, end: u64) -> bool {
     let Some(b0) = view.read(end - 1, 1).and_then(|s| s.first().copied()) else {
         return true;
     };
-    // ret / retf / ret imm / int3 / jmp: a function may end on any of these.
+    // ret / retf / ret imm / int3 / jmp: the previous code cannot fall through
+    // into `end` on any of these, so the split is genuine. This only feeds the
+    // PE `.pdata` fold now; Mach-O and ELF use exact bounds (see below).
     if matches!(b0, 0xC2 | 0xC3 | 0xCA | 0xCB | 0xCC | 0xE9 | 0xEB) {
         return true;
     }
@@ -139,22 +146,49 @@ fn ends_function(view: &View, end: u64) -> bool {
         )
 }
 
-/// Exclusive end of the *logical* function starting at `addr`. PE `.pdata` can
-/// split one function into several contiguous entries; follow those splits so
-/// the whole body is scanned. Falls back to a fixed window when the container
-/// carries no boundary metadata (ELF) or the entry is missing.
-fn function_end(view: &View, addr: u64) -> u64 {
-    let mut end = view.function_end(addr).unwrap_or(addr + MAX_FUNCTION_SCAN);
-    for _ in 0..MAX_PDATA_MERGE {
-        if ends_function(view, end) {
-            break;
-        }
-        match view.function_end(end) {
-            Some(next) if next > end => end = next,
-            _ => break,
-        }
+/// Forward-decode from `addr` until the first terminator, returning the
+/// exclusive end of that instruction run. Used for containers without boundary
+/// metadata (ELF); falls back to `MAX_TERMINATOR_SCAN` if no terminator is seen.
+fn decode_to_terminator(view: &View, addr: u64) -> u64 {
+    let end = addr.saturating_add(MAX_TERMINATOR_SCAN);
+    let bytes = read_region(view, addr, end);
+    match view.arch() {
+        Arch::X86_64 => x86::function_end(bytes, addr),
+        Arch::AArch64 => aarch64::function_end(bytes, addr),
+        _ => addr.saturating_add(MAX_FUNCTION_SCAN),
     }
-    end
+}
+
+/// The authoritative end of the function that *starts* at `addr`, chosen by
+/// container:
+///
+/// * PE - `.pdata`, folding contiguous split entries (QQ emits several).
+/// * Mach-O - `LC_FUNCTION_STARTS` is exact; the next start is the end.
+/// * ELF - no metadata, so decode forward to the first terminator.
+///
+/// `addr` is always a real function entry here, so none of these may silently
+/// extend into a neighbouring function: that is exactly the bug that used to
+/// make the locator return an unrelated helper.
+fn function_end(view: &View, addr: u64) -> u64 {
+    match view.format() {
+        Format::Pe => {
+            let mut end = view.function_end(addr).unwrap_or(addr + MAX_FUNCTION_SCAN);
+            for _ in 0..MAX_PDATA_MERGE {
+                if ends_function(view, end) {
+                    break;
+                }
+                match view.function_end(end) {
+                    Some(next) if next > end => end = next,
+                    _ => break,
+                }
+            }
+            end
+        }
+        Format::MachO => view
+            .function_end(addr)
+            .unwrap_or_else(|| decode_to_terminator(view, addr)),
+        Format::Elf => decode_to_terminator(view, addr),
+    }
 }
 
 fn scan_vtable(view: &View, vtable_addr: u64) -> Option<VtableHit> {

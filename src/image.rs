@@ -237,6 +237,11 @@ impl<'a> View<'a> {
         self.slice.abi
     }
 
+    /// Container format of the slice (ELF / PE / Mach-O).
+    pub fn format(&self) -> Format {
+        self.slice.format
+    }
+
     pub fn describe(&self) -> String {
         self.slice.describe()
     }

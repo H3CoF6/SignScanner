@@ -40,6 +40,49 @@ fn is_strb_unscaled(w: u32) -> bool {
     (w & 0xFFE0_0000) == 0x3800_0000
 }
 
+/// `RET` (with any register): `1101011 0 0 10 11111 000000 Rn 00000`.
+fn is_ret(w: u32) -> bool {
+    (w & 0xFFFF_FC1F) == 0xD65F_0000
+}
+
+/// `BR` (branch to register, e.g. a tail call): `1101011 0000 11111 000000 Rn
+/// 00000`. Treated as an end when it closes a run — the body cannot fall
+/// through, and unlike x86 AArch64 has no switch-dispatch-via-branch idiom in
+/// the middle of these functions.
+fn is_br(w: u32) -> bool {
+    (w & 0xFFFF_FC1F) == 0xD61F_0000
+}
+
+/// `B` (unconditional branch, `imm26`): `000101 imm26`. Only ends a run when it
+/// targets the function itself (an infinite loop); ordinary `B`/`BL` stay
+/// inside the function, so we do not stop on them.
+fn is_b(w: u32) -> bool {
+    (w & 0xFC00_0000) == 0x1400_0000
+}
+
+/// Exclusive end of the instruction run starting at `ip`: just past the first
+/// `RET`/`BR`. Containers without boundary metadata (ELF) use this to bound a
+/// function instead of guessing a fixed window. If none is found the whole
+/// `data` slice is returned.
+pub fn function_end(data: &[u8], ip: u64) -> u64 {
+    let mut i = 0usize;
+    while i + 4 <= data.len() {
+        let w = word_at(data, i);
+        if is_ret(w) || is_br(w) {
+            return ip + (i as u64) + 4;
+        }
+        if is_b(w) {
+            // `b .` (branch to self) terminates; nothing else does.
+            let off = sext(((w & 0x03FF_FFFF) as u64) << 2, 28);
+            if off == 0 {
+                return ip + (i as u64) + 4;
+            }
+        }
+        i += 4;
+    }
+    ip + data.len() as u64
+}
+
 /// Every direct `BL` target in `data` (first instruction at virtual address
 /// `ip`).
 pub fn direct_calls(data: &[u8], ip: u64) -> Vec<u64> {
@@ -125,5 +168,23 @@ mod tests {
         let code = 0xD65F_03C0u32.to_le_bytes();
         assert_eq!(buffer_hits(&code, 0), BufferHits::default());
         assert!(direct_calls(&code, 0).is_empty());
+    }
+
+    #[test]
+    fn function_end_stops_past_ret() {
+        // nop ; ret  -> end is just past the `ret`.
+        let mut code = Vec::new();
+        code.extend_from_slice(&0xD503_201Fu32.to_le_bytes()); // nop
+        code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes()); // ret
+        assert_eq!(function_end(&code, 0x1000), 0x1008);
+    }
+
+    #[test]
+    fn function_end_does_not_stop_on_an_interior_branch() {
+        // bl +0 (a normal call) is not an end; the `ret` past it is.
+        let mut code = Vec::new();
+        code.extend_from_slice(&0x9400_0000u32.to_le_bytes()); // bl .
+        code.extend_from_slice(&0xD65F_03C0u32.to_le_bytes()); // ret
+        assert_eq!(function_end(&code, 0x2000), 0x2008);
     }
 }

@@ -5,6 +5,32 @@ use iced_x86::{Code, Decoder, DecoderOptions, Mnemonic, OpKind};
 
 use crate::decode::BufferHits;
 
+/// Exclusive end of the instruction run starting at `ip`, i.e. the address just
+/// past its first `ret`/`retf`/`int3`. Containers without function-boundary
+/// metadata (ELF) use this to bound a function without guessing a fixed window.
+///
+/// Only *return* and `int3` padding end a run: a `jmp` is usually the
+/// compiler's switch/tail-call spelling and the body continues past it, so
+/// stopping there would truncate the sign core. If no terminator is found the
+/// whole `data` slice is returned, letting the caller fall back to its own cap.
+pub fn function_end(data: &[u8], ip: u64) -> u64 {
+    let mut dec = Decoder::with_ip(64, data, ip, DecoderOptions::NONE);
+    while dec.can_decode() {
+        let pos = dec.position();
+        let insn = dec.decode();
+        if insn.code() == Code::INVALID {
+            let _ = dec.set_position(pos + 1);
+            continue;
+        }
+        match insn.mnemonic() {
+            Mnemonic::Ret | Mnemonic::Retf => return ip + dec.position() as u64,
+            Mnemonic::Int3 => return ip + pos as u64,
+            _ => {}
+        }
+    }
+    ip + data.len() as u64
+}
+
 /// Disassemble `data` (whose first byte lives at virtual address `ip`) and
 /// return every direct `call rel32` target.
 pub fn direct_calls(data: &[u8], ip: u64) -> Vec<u64> {
@@ -119,5 +145,28 @@ mod tests {
         // mov byte ptr [rip+0x2FF], al -> must not count as a result-buffer store.
         let code = [0x88, 0x05, 0xFF, 0x02, 0x00, 0x00, 0xC3];
         assert!(!buffer_hits(&code, 0x1000).all());
+    }
+
+    #[test]
+    fn function_end_stops_past_the_first_return() {
+        // push rbp; mov rbp,rsp; ...; ret  (0x55 0x48 0x89 0xE5 0xC3 0xCC 0xCC)
+        let code = [0x55, 0x48, 0x89, 0xE5, 0xC3, 0xCC, 0xCC];
+        assert_eq!(function_end(&code, 0x1000), 0x1005);
+    }
+
+    #[test]
+    fn function_end_does_not_stop_on_an_interior_jump() {
+        // A `jmp` is switch/tail-call spelling, not an end: the real `ret` is
+        // further down, so the body must run all the way to it.
+        // jmp +0 ; nop ; ret
+        let code = [0xEB, 0x00, 0x90, 0xC3];
+        assert_eq!(function_end(&code, 0x2000), 0x2004);
+    }
+
+    #[test]
+    fn function_end_falls_back_to_the_whole_slice() {
+        // No terminator at all -> clamp to the slice end (caller caps further).
+        let code = [0x90, 0x90, 0x90, 0x90];
+        assert_eq!(function_end(&code, 0x3000), 0x3004);
     }
 }
